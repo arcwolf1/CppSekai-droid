@@ -416,7 +416,44 @@ void loadIntroFonts()
     ImGuiIO& io = ImGui::GetIO();
 
 #ifdef __ANDROID__
-    // Android 系统字体：优先华为鸿蒙中文，其次 AOSP/Noto 的 CJK
+    // 优先用 APK 内置字体（AssetExtractor 释放到 /sdcard/CppSekai/assets/fonts/）
+    {
+        const char* bundled = "/sdcard/Android/data/com.xxtsoft.cppsekai/files/fonts/cjk.ttf";
+        std::FILE* probe = std::fopen(bundled, "rb");
+        if (probe != nullptr) {
+            std::fclose(probe);
+            const float kFontSize = 42.0f;
+            ImFontConfig config;
+            config.OversampleH = 2;
+            config.OversampleV = 2;
+            std::snprintf(config.Name, sizeof(config.Name), "CppSekai Bundled");
+
+            ImFont* font = io.Fonts->AddFontFromFileTTF(bundled, kFontSize, &config,
+                io.Fonts->GetGlyphRangesJapanese());
+            if (font != nullptr) {
+                ImFontConfig merge;
+                merge.MergeMode = true;
+                merge.OversampleH = 2;
+                merge.OversampleV = 2;
+                io.Fonts->AddFontFromFileTTF(bundled, kFontSize, &merge,
+                    io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+
+                gBodyFont = gTitleFont = gDiffFont = font;
+                gBodyFontPath = bundled;
+                if (gBoldFont == nullptr) gBoldFont = font;
+                if (gCondFont == nullptr) gCondFont = font;
+
+                io.Fonts->Build();
+                std::printf("[intro] bundled font %s @%.0fpx loaded\n", bundled, kFontSize);
+                return;
+            }
+            std::printf("[intro] bundled font load failed, falling back to system\n");
+        } else {
+            std::printf("[intro] bundled font not found at %s\n", bundled);
+        }
+    }
+
+    // 系统字体回退
     {
         const char* candidates[] = {
             "/system/fonts/HarmonyOSHans.ttf",

@@ -1,12 +1,6 @@
 // CppSekai - Project SEKAI style SUS chart player (Windows native)
 // Derived from sekai-mmw-preview-web (AGPL-3.0), which is based on
 // MikuMikuWorld (MIT). See README.md for details.
-// Android port by the cppsekai-android project (AGPL-3.0):
-//   https://github.com/arcwolf1/cppsekai-android
-// Android port by the cppsekai-android project (AGPL-3.0):
-//   https://github.com/arcwolf1/cppsekai-android
-// Android port by the cppsekai-android project (AGPL-3.0):
-//   https://github.com/<YOUR-USERNAME>/cppsekai-android
 // We provide our own console main(); tell SDL not to redefine it as SDL_main.
 // Windows：自己定义 main，告诉 SDL 不要替换成 SDL_main。
 // Android：必须让 SDL 替换 main -> SDL_main，否则 SDLActivity 找不到入口。
@@ -1142,8 +1136,8 @@ bool fitWindowToDesktop(int& w, int& h, int margin, bool usableArea)
     if (w <= limit.w && h <= limit.h) {
         return false;
     }
-    const int fitW = std::max(320, limit.w - margin);
-    const int fitH = std::max(240, limit.h - margin);
+    const int fitW = std::max(160, limit.w - margin);
+    const int fitH = std::max(128, limit.h - margin);
     std::printf("[window] %dx%d does not fit the %dx%d desktop, using %dx%d\n", w, h, limit.w,
         limit.h, std::min(w, fitW), std::min(h, fitH));
     std::fflush(stdout);
@@ -1700,9 +1694,17 @@ int main(int argc, char** argv)
     // window we are about to create. Command-line flags win over saved values.
     std::string baseDir;
 #ifdef __ANDROID__
-    // Android: SDL_GetBasePath() returns the APK's native library dir, which
-    // only holds .so files. All game resources live on external storage.
-    baseDir = "/sdcard/CppSekai/";
+    // Android: 资源在 /sdcard/Android/data/com.xxtsoft.cppsekai/files/
+    // 由 AssetExtractor.java 首次启动时释放。这个路径从 Android 4.4 到 15
+    // 都可写且不需要权限。
+    {
+        const char* extPath = SDL_AndroidGetExternalStoragePath();
+        if (extPath != nullptr) {
+            baseDir = std::string(extPath) + "/";
+        } else {
+            baseDir = "/sdcard/Android/data/com.xxtsoft.cppsekai/files/";
+        }
+    }
 #else
     {
         char* basePath = SDL_GetBasePath();
@@ -1964,8 +1966,8 @@ int main(int argc, char** argv)
         winWidth = userSettings.windowWidth;
         winHeight = userSettings.windowHeight;
     }
-    int resW = std::max(320, renderSizeW > 0 ? renderSizeW : winWidth);
-    int resH = std::max(240, renderSizeH > 0 ? renderSizeH : winHeight);
+    int resW = std::max(160, renderSizeW > 0 ? renderSizeW : winWidth);
+    int resH = std::max(128, renderSizeH > 0 ? renderSizeH : winHeight);
     if (!fpsGiven) {
         fpsLimit = userSettings.fpsLimit;
     }
@@ -2475,13 +2477,23 @@ int main(int argc, char** argv)
     int winCanvasH = windowH;
     auto applyRenderMode = [&]() {
 #ifdef __ANDROID__
-        // Android: 强制固定分辨率渲染。全屏下 renderScale=0 会按 2400x1080
-        // 全分辨率渲染，又卡又让 UI 相对过大；固定 1366x768 后画面流畅、
-        // 布局也和 Windows 一致。
+        // Android: 强制固定分辨率渲染。全屏下 renderScale=0 会按设备全分辨率
+        // 渲染，既卡又让 UI 相对过大。按屏幕短边自动选渲染分辨率：
+        //   <=170px   → 160x128  （MP4 128x160 物理屏）
+        //   <=340px   → 320x256  （MP4 覆盖 256x320 / 小屏手机）
+        //   其他      → 保留用户设置（默认 1366x768，正常设备）
         userSettings.renderScale = 1;
+        const int screenMin = std::min(drawableW, drawableH);
+        if (screenMin <= 170) {
+            resW = 160;
+            resH = 128;
+        } else if (screenMin <= 340) {
+            resW = 320;
+            resH = 256;
+        }
 #endif
         if (userSettings.renderScale == 1) {
-            renderer.setRenderTargetSize(std::max(320, resW), std::max(240, resH));
+            renderer.setRenderTargetSize(std::max(160, resW), std::max(128, resH));
         } else {
             renderer.setRenderTargetSize(0, 0);
         }
@@ -3689,8 +3701,8 @@ int main(int argc, char** argv)
             // The window itself only follows at the next launch, but in the
             // fixed render mode this is the size the game draws at - that part
             // takes effect right here.
-            resW = std::max(320, userSettings.windowWidth);
-            resH = std::max(240, userSettings.windowHeight);
+            resW = std::max(160, userSettings.windowWidth);
+            resH = std::max(128, userSettings.windowHeight);
         }
         audio.setBgmVolume(userSettings.bgmVolume);
         audio.setUserOffset(userSettings.offsetSec);
@@ -4285,8 +4297,8 @@ int main(int argc, char** argv)
                 // target always - in the fixed render mode that is what actually
                 // decides how much the game draws.
                 auto applySize = [&]() {
-                    resW = std::clamp(resW, 320, 7680);
-                    resH = std::clamp(resH, 240, 4320);
+                    resW = std::clamp(resW, 160, 7680);
+                    resH = std::clamp(resH, 128, 4320);
                     userSettings.windowWidth = resW;
                     userSettings.windowHeight = resH;
                     if (windowMode != 2) {
@@ -5174,12 +5186,15 @@ int main(int argc, char** argv)
                 aboutGap();
                 aboutLine("策划 / 开发");
                 aboutLine("xxt8582753（BSOD-MEMZ）");
+                aboutLine("Android 移植");
+                aboutLine("Arcwolf");
                 aboutLine("测试");
                 aboutLine("Shitakara4banme");
                 aboutGap();
                 aboutLine("");
                 aboutLine("株洲市南方中学");
-                aboutLine("2026年9月");
+                aboutLine("Arcwolf Networks");
+                aboutLine("2026年10月");
                 ImGui::PopFont();
                 aboutGap();
                 // The two links side by side: stacked they cost one more row than
@@ -5191,7 +5206,7 @@ int main(int argc, char** argv)
                 {
                     const float linkW = (interior - 8.0f * s) * 0.5f;
                     if (ui::capsuleButton("GitHub", ImVec2(linkW, 44.0f * s), true)) {
-                        openUrl(L"https://github.com/BSOD-MEMZ/CppSekai");
+                        openUrl(L"https://github.com/arcwolf1/CppSekai-droid");
                     }
                     ImGui::SameLine();
                     if (ui::capsuleButton("访问 xxtsoft", ImVec2(linkW, 44.0f * s), false)) {

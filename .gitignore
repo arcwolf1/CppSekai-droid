@@ -25,3 +25,6 @@ local.properties
 Drafts/
 toolchain/
 prebuilt/
+
+# 软链接（指向开发机本地 prebuilt）
+CppSekai/prebuilt

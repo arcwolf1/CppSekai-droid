@@ -2623,8 +2623,16 @@ int drawSongSelect(platform::Renderer& renderer, const std::vector<ChartEntry>& 
     // laid out with. The phone panel below is the one piece sized from the window
     // itself, so it multiplies the scale as well - otherwise the list would grow
     // while the panel stayed put.
-    const float scale = std::clamp(uiScale, 0.5f, 2.0f);
-    const float kBase = std::clamp(h / 1080.0f, 0.5f, 2.0f);
+    const float scale = std::clamp(uiScale, 0.15f, 2.0f);
+    // kBase 取"高度基准"和"宽度基准"的较小值：
+    //   高度基准 h/1080 —— 1080p 参考布局
+    //   宽度基准 w/1468 —— 顶栏一排元素（搜索框 + 2 下拉 + 4 按钮）的总宽，
+    //                     窄屏时如果不按宽度缩，按钮会溢出屏幕右侧
+    // 下限 0.15 是给 Android 低分辨率模式留的（128x160 时 w/1468 ≈ 0.087，
+    // 320x256 时 w/1468 ≈ 0.218）。
+    const float kBaseH = h / 1080.0f;
+    const float kBaseW = w / 1468.0f;
+    const float kBase = std::clamp(std::min(kBaseH, kBaseW), 0.15f, 2.0f);
     const float k = kBase * scale;
 
     static std::vector<SongGroup> groups;

@@ -7,28 +7,32 @@ import android.util.Log;
 import java.io.*;
 
 /**
- * 首次启动时把 APK 内 assets/ 释放到 /sdcard/CppSekai/。
+ * 首次启动时把 APK 内 assets/ 释放到 app 外部私有目录。
+ * 路径 = Context.getExternalFilesDir(null)，即
+ *   /storage/emulated/0/Android/data/com.xxtsoft.cppsekai/files/
+ * 与 C++ 层的 SDL_AndroidGetExternalStoragePath() 一致，
+ * 从 Android 4.4 到 15 都可写且无需权限。
+ *
  * 用标记文件避免重复释放——只在首次安装或版本更新后触发。
  */
 public class AssetExtractor {
     private static final String TAG = "CppSekai";
-    private static final String TARGET_ROOT = "/sdcard/CppSekai";
-    private static final String MARKER = TARGET_ROOT + "/.extracted_v1";
+    private static final String MARKER_NAME = ".extracted_v1";
 
     public static void extractIfNeeded(Context ctx) {
-        File marker = new File(MARKER);
+        File root = getTargetRoot(ctx);
+        if (!root.exists() && !root.mkdirs()) {
+            Log.e(TAG, "Cannot create " + root);
+            return;
+        }
+
+        File marker = new File(root, MARKER_NAME);
         if (marker.exists()) {
             Log.i(TAG, "Assets already extracted, skip.");
             return;
         }
 
-        File root = new File(TARGET_ROOT);
-        if (!root.exists() && !root.mkdirs()) {
-            Log.e(TAG, "Cannot create " + TARGET_ROOT);
-            return;
-        }
-
-        Log.i(TAG, "Extracting assets to " + TARGET_ROOT + " ...");
+        Log.i(TAG, "Extracting assets to " + root + " ...");
         long start = System.currentTimeMillis();
         int count = extractDir(ctx.getAssets(), "", root);
         long elapsed = System.currentTimeMillis() - start;
@@ -39,6 +43,16 @@ public class AssetExtractor {
         } catch (IOException e) {
             Log.w(TAG, "Cannot write marker: " + e);
         }
+    }
+
+    /** 目标目录：app 的外部私有目录。 */
+    private static File getTargetRoot(Context ctx) {
+        File f = ctx.getExternalFilesDir(null);
+        if (f == null) {
+            // 极端回退：外部存储不可用
+            f = new File("/sdcard/Android/data/com.xxtsoft.cppsekai/files");
+        }
+        return f;
     }
 
     /** 递归遍历 assets 目录，返回释放的文件数。 */

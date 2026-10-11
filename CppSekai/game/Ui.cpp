@@ -427,7 +427,9 @@ float scale()
 {
     const ImVec2 display = ImGui::GetIO().DisplaySize;
     // 860p reference: cards stay comfortably small (at 720p this is ~0.84).
-    return std::clamp(display.y / 860.0f, 0.55f, 2.0f);
+    // 下限 0.15 是给 Android 低分辨率模式留的：256px 高时得 0.297，
+    // 128px 高时得 0.149。0.55 会把 UI 放大到挤出屏幕。
+    return std::clamp(display.y / 860.0f, 0.15f, 2.0f);
 }
 
 bool beginCard(const char* id, ImVec2* center, ImVec2* size, bool showClose, bool dimBackdrop,

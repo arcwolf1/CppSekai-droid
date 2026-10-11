@@ -14,8 +14,9 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class DownloadActivity extends Activity {
-    static final String ROOT   = "/sdcard/CppSekai";
-    static final String CHARTS = ROOT + "/charts";
+    // 动态获取路径：与 C++ 层和 AssetExtractor 一致
+    private String ROOT;
+    private String CHARTS;
     static final String[] DIFFS = {"easy", "normal", "hard", "expert", "master"};
     static final int CN_MIN = 10000;
     static final String CN_BASE = "https://storage.sekai.best/sekai-cn-assets";
@@ -37,6 +38,12 @@ public class DownloadActivity extends Activity {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        File extRoot = getExternalFilesDir(null);
+        if (extRoot == null) extRoot = new File("/sdcard/Android/data/com.xxtsoft.cppsekai/files");
+        ROOT = extRoot.getAbsolutePath();
+        CHARTS = ROOT + "/charts";
+        extRoot.mkdirs();
+        new File(CHARTS).mkdirs();
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
