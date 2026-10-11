@@ -1,0 +1,42 @@
+# Build output
+build/
+
+# Bundled toolchain (~300MB; re-fetch with: bash setup.sh)
+toolchain/
+
+# Game assets from upstream repo (pjsk sprites / SE; re-fetch with: bash setup.sh)
+# Tracked in full since 2026-09-12: the old "assets/*" + re-include rules
+# silently dropped hand-curated sprites (select / fx / ui / splashscreen) on
+# every git add. setup.sh still restores assets/mmw if it ever goes missing.
+
+# Downloaded charts & audio (official game data; personal use only)
+charts/
+
+# Player data: settings + play results (written next to charts/). Ignored on
+# purpose - it is per-player state, not source. Copy this file to a new machine
+# together with charts/ to keep the records (scores are keyed by chart name).
+userdata.json
+
+# Per-user profiles (settings / scores / account per player, 2026-09-16).
+# Same reasoning as userdata.json: this is someone's save, not source.
+profiles/
+
+# Downloader settings (chartdl.json sits next to chartdl.exe)
+chartdl.json
+
+# Release staging + archives (made by: bash package.sh)
+dist/
+
+# Local runtime artifacts
+*.log
+*.pdb
+imgui.ini
+
+# Scratch screenshots from --screenshot runs (see AGENTS.md "验证")
+.workbuddy/shots/
+# Local backups of pre-shrink assets (the originals also live in git history).
+.workbuddy/backup/
+
+# Python bytecode from the .workbuddy/tools helpers
+__pycache__/
+*.pyc

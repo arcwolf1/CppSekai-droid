@@ -1,0 +1,369 @@
+// CppSekai - judgement engine
+// Consumes the packed HitEvent stream produced by the chart core and turns
+// player input (multi-touch / keyboard) into PERFECT / GREAT / GOOD / MISS.
+//
+// HitEvent packed layout (7 floats per event, sorted by timeSec):
+//   [0] timeSec   note hit time in chart seconds
+//   [1] center    lane coordinate of note center (world x units)
+//   [2] width     note width in lane units
+//   [3] kind      0=tap 1=critical tap 2=flick 3=trace(friction)
+//                 4=hold tick(auto) 5=hold start (endTimeSec valid)
+//   [4] flags     bit0 = critical, bits 1-2 = flick direction (FlickDir)
+//   [5] endTimeSec  hold end time (-1 for non-holds)
+//   [6] volume    SE volume at this note
+#pragma once
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace game
+{
+
+// Flick direction, mirroring the core's FlickType (None/Default/Left/Right).
+enum FlickDir : std::uint8_t
+{
+    FlickNone = 0,
+    FlickUp = 1,
+    FlickLeft = 2,
+    FlickRight = 3,
+};
+
+enum class Judge : std::uint8_t
+{
+    Perfect,
+    Great,
+    Good,
+    Bad,
+    Miss,
+    None,
+};
+
+struct HitNote
+{
+    float timeSec = 0.0f;
+    float center = 0.0f;
+    float width = 1.0f;
+    float kind = 0.0f;
+    float flags = 0.0f;
+    float endTimeSec = -1.0f;
+    float volume = 1.0f;
+
+    std::uint8_t state = 0; // 0 pending, 1 hit, 2 missed
+    // Set for the note the chart core emits at a hold's end time (SUS
+    // NoteType::HoldEnd). It looks like a plain tap in the HitEvent stream,
+    // but pjsk judges it by *releasing* the lane at the tail, so it must not
+    // go through the plain auto-miss path.
+    bool holdTail = false;
+    // CppSekai: hold bookkeeping for kind 4 ticks, resolved in load(). A tick
+    // may only auto-hit while the hold it belongs to was actually grabbed
+    // (its start note is in state 1) and has not broken; otherwise the tick is
+    // consumed silently - the hold's own miss already counted for all of it.
+    std::size_t holdStartIndex = static_cast<std::size_t>(-1);
+    std::size_t holdMarkerIndex = static_cast<std::size_t>(-1);
+};
+
+struct JudgementWindows
+{
+    // Defaults = the 宽松 preset from 设置 > 判定 (见 game/SongSelect.hpp 里
+    // UserSettings 的同名项：官方窗口各放宽 30 ms)。装机设定是宽松，所以这里
+    // 跟着宽松，两边不会打架。
+    float perfectMs = 70.0f;
+    float greatMs = 120.0f;
+    float goodMs = 170.0f;
+    // BAD window end. The official table puts BAD at 108.3..125 ms with MISS
+    // past that; this engine's windows are wider, so BAD fills the gap between
+    // goodMs and the auto-miss window (missAfterMs). The two are tied together
+    // in the settings UI, but they are separate knobs on purpose: badMs is how
+    // late a press may land and still count as BAD, missAfterMs is when an
+    // untouched note gives up. Both end at the same place in the stock config.
+    float badMs = 230.0f;
+    float missAfterMs = 230.0f;
+    // Long notes (settings > 判定 > 长条容错). A hold that is let go earlier
+    // than tailGraceMs before its end breaks mid-way, and the lane may be
+    // grabbed up to startGraceMs after the hold start without counting as a
+    // break. Both used to be hard-coded (180 / 140 ms).
+    float holdTailGraceMs = 180.0f;
+    float holdStartGraceMs = 140.0f;
+};
+
+// Life pool. pjsk starts every live at 1000 life (skills can push it to
+// 2000, which we do not model). Judgement costs, from the official table:
+// MISS -80, BAD -50, a hold broken mid-way -40.
+constexpr float kMaxLife = 1000.0f;
+
+// Upper bound of the "初始血量" setting (settings > 判定 > 初始血量). pjsk itself
+// never leaves 1000 - it is a practice knob, so the pool may go well past it.
+// The bar is normalised against whatever pool the run started with, so a big
+// pool still reads 100% at the start instead of overflowing the panel.
+constexpr float kMaxInitialLife = 5000.0f;
+
+// Score constants ported from sekai-mmw-preview-web's overlay player
+// (native/src/mmw_overlay_player.cpp). The score of a note is
+//   (TEAM_POWER / weightedNoteCount) * 4 * noteWeight * levelFactor * comboFactor
+// scaled by the judgement multiplier (PERFECT 1.0 / GREAT 0.7 / GOOD 0.5),
+// with comboFactor growing by 0.01 per 100 combo up to 1.1.
+constexpr double kTeamPower = 250000.0;
+constexpr float kDefaultChartRating = 26.0f;
+
+struct JudgementStats
+{
+    int perfect = 0;
+    int great = 0;
+    int good = 0;
+    int bad = 0;
+    int miss = 0;
+    int combo = 0;
+    int maxCombo = 0;
+    // Successful-hit tallies, for the host's per-hit feedback (the pad rumble
+    // flavours in main.cpp). Counted inside registerJudge - i.e. where only real
+    // hits pass - so diffing them is exact even when a chord is judged within a
+    // single frame, which lastHitKind / lastJudgeCritical cannot do (they only
+    // describe the last note of that frame).
+    int hitCount = 0;
+    int criticalHitCount = 0; // 绝赞: the chart's critical flag (SUS flags & 1)
+    int flickHitCount = 0;    // HitEvent kind 2
+    double score = 0.0;
+    // Score gained by the most recent judgement, and the chart time of the
+    // note that produced it. The HUD prints it as the floating "+N" next to the
+    // score panel (upstream: HudSnapshot::scoreDelta + scorePlusTriggerSec).
+    // 0 for a MISS / BAD, which is what keeps the "+N" from showing up on them.
+    double lastScoreDelta = 0.0;
+    float scoreDeltaAtSec = -100.0f;
+    float life = kMaxLife;
+    int holdTails = 0;  // hold tails judged by releasing / holding through
+    int holdBreaks = 0; // holds let go too early (mid-hold MISS)
+
+    Judge lastJudge = Judge::None;
+    float lastJudgeTimeSec = -100.0f;
+    bool lastJudgeCritical = false;
+    float lastHitKind = -1.0f;   // HitEvent kind of the last successful player hit
+    float lastHitCenter = 0.0f;  // lane coordinate of the last successful player hit
+    float lastHitWidth = 0.0f;   // lane width of the last successful player hit
+    float lastHitTimeSec = -1.0f; // the hit note's own time (HitEvent timeSec)
+    std::uint8_t lastHitFlickDir = 0; // the note's flick direction (FlickDir)
+    bool lastHitFriction = false;
+};
+
+class JudgementEngine
+{
+  public:
+    // Debug (settings > 判定 > Flick 调试日志): a flick note near a chart time,
+    // handed to the host's log so a touch flick that produced nothing can say
+    // what it was aiming at. See debugFlickNotesNear().
+    struct FlickDebugNote
+    {
+        float timeSec = 0.0f;
+        float center = 0.0f;
+        float width = 1.0f;
+        std::uint8_t dir = FlickNone; // required swipe direction
+        std::uint8_t state = 0;       // 0 pending, 1 hit, 2 missed
+    };
+
+    // Packed HitEvents from the chart core (getHitEventBufferPointer).
+    void load(const float* packed, int count);
+    void reset();
+
+    // Life the next session starts with (settings > 判定 > 初始血量). reset() - which
+    // runs per session - seeds the stats from it, so push it before a chart loads.
+    // Clamped to 1..kMaxInitialLife.
+    void setInitialLife(float life) { mInitialLife = std::clamp(life, 1.0f, kMaxInitialLife); }
+    [[nodiscard]] float initialLife() const { return mInitialLife; }
+
+    // Ceiling for the life *value*. A pool above kMaxLife (初始血量 > 1000) must
+    // not be clipped back down to 1000 by the damage handlers.
+    [[nodiscard]] float lifeCeiling() const { return std::max(kMaxLife, mInitialLife); }
+
+    // Advances auto-miss / hold tracking. Call once per frame with chart time.
+    void update(float songTimeSec);
+
+    // Player input. lanePos is in lane coordinates (world x units);
+    // a note matches when center - width/2 - margin <= lanePos <= center + width/2 + margin.
+    // Flick input carries the swipe direction; in strict mode (default) a
+    // flick note only clears when the direction matches (up flicks also
+    // accept the ambiguous FlickNone), and a plain tap never clears a flick.
+    // Returns the judge result if a note was hit, Judge::None otherwise.
+    Judge tap(float lanePos, float songTimeSec, bool critical, float margin = 0.5f);
+    Judge flick(float lanePos, float songTimeSec, FlickDir dir, float margin = 0.5f);
+
+    // Keyboard lane tracking for hold notes. heldLanes is a list of currently
+    // held lane positions; touches count as holds while the finger is down.
+    void setHoldLanes(const std::vector<float>& lanes) { mHoldLanes = lanes; }
+
+    // True while at least one hold is being tracked (started and not yet
+    // finished/broken). criticalOut receives whether it is a critical hold -
+    // used to pick the hold loop SE variant.
+    [[nodiscard]] bool anyActiveHold(bool* criticalOut = nullptr) const;
+
+    [[nodiscard]] const JudgementStats& stats() const { return mStats; }
+
+    // Debug: every flick note (kind 2) within +-windowSec of songTimeSec, so a
+    // touch flick that cleared nothing can be explained in the log. Only call
+    // it while the debug log is on - it walks the whole note list.
+    void debugFlickNotesNear(float songTimeSec, float windowSec, std::vector<FlickDebugNote>& out) const;
+
+    [[nodiscard]] const JudgementWindows& windows() const { return mWindows; }
+    void setWindows(const JudgementWindows& windows) { mWindows = windows; }
+
+    // Chart level, used by the score formula's levelFactor (the upstream
+    // overlay player hard-codes 26; we use the song's real difficulty level).
+    void setChartRating(float rating)
+    {
+        if (rating > 0.0f) {
+            mChartRating = rating;
+        }
+    }
+    [[nodiscard]] float chartRating() const { return mChartRating; }
+
+    // Life in 0..1, for the HUD's life bar. Normalised against the pool the run
+    // STARTED with, so the bar reads 100% at the beginning whatever 初始血量 is
+    // (a 5000 pool used to be clipped at 1000 and a 300 pool started two thirds
+    // empty - neither matched what the player asked for).
+    [[nodiscard]] float lifeRatio() const
+    {
+        const float pool = mInitialLife > 1.0f ? mInitialLife : kMaxLife;
+        return std::clamp(mStats.life / pool, 0.0f, 1.0f);
+    }
+
+    // Long notes the player let go of too early, appended to `out` as flat
+    // (center, hold start time seconds) pairs - the same key the chart core's
+    // kind 5 HitEvent uses, so the renderer can dim the right hold. Call every
+    // frame and hand the result to core_api::setDimmedHolds().
+    void appendDimmedHoldKeys(std::vector<float>& out) const;
+
+    // CppSekai: holds whose start note was never hit at all. Same flat
+    // (center, hold start time) key layout as the dimmed list. The renderer
+    // lets these keep scrolling past the judgement line instead of parking on
+    // it (pjsk: a missed hold falls off the screen like any missed note).
+    // Append-only per session; cleared by reset().
+    [[nodiscard]] const std::vector<float>& missedHoldKeys() const { return mMissedHoldKeys; }
+
+    // CppSekai: indices into the core's HitEvent stream of every note this
+    // engine resolved as HIT (taps, flicks, traces, hold tails, ticks).
+    // Append-only per session; the host feeds them to core_api::markNoteHit()
+    // so the renderer can remove hit notes from the field immediately.
+    [[nodiscard]] const std::vector<int>& hitEventIndices() const { return mHitEventIndices; }
+
+    // Strict flick validation: on (default) a flick needs a matching swipe
+    // direction and taps never clear flicks; off restores the lenient
+    // skeleton behavior (any flick gesture / tap clears any flick note).
+    void setStrictFlick(bool strict) { mStrictFlick = strict; }
+    [[nodiscard]] bool strictFlick() const { return mStrictFlick; }
+
+    // "Flick 视作 Tap" (settings > 判定), off by default: every flick note
+    // becomes an ordinary tap - any press inside its window clears it, whatever
+    // gesture produced it (so the swipe direction stops mattering). For
+    // touchscreens where an upward swipe is hard to trigger.
+    //
+    // A hold whose TAIL is a flick is deliberately not turned into a tap: the
+    // player is still holding that lane, so a tail that demanded a press would
+    // be unfair and one that demanded a swipe is exactly what this setting is
+    // here to avoid. Such a tail stops being a note at all - it is completed
+    // when the hold reaches its end (no input, no penalty), the same way
+    // autoplay resolves it. See the hold tracking in update().
+    void setFlickAsTap(bool on) { mFlickAsTap = on; }
+    [[nodiscard]] bool flickAsTap() const { return mFlickAsTap; }
+
+    // CppSekai: autoplay (chart preview) mode - every scoreable note is
+    // resolved as a PERFECT exactly on its own time, holds never break and
+    // tails hold through. Feeds the HUD a full-combo run without any input.
+    void setAutoPlay(bool autoPlay) { mAutoPlay = autoPlay; }
+    [[nodiscard]] bool autoPlay() const { return mAutoPlay; }
+
+    [[nodiscard]] bool loaded() const { return mLoaded; }
+    [[nodiscard]] int totalNotes() const { return mTotalScoreNotes; }
+
+    [[nodiscard]] bool hasPendingNotes() const { return mCursor < mNotes.size(); }
+
+  private:
+    struct ActiveHold
+    {
+        std::size_t noteIndex = 0;   // the kind 5 marker
+        std::size_t startIndex = static_cast<std::size_t>(-1); // the start tap
+        float startTimeSec = 0.0f;
+        float endTimeSec = 0.0f;
+        float center = 0.0f;
+        float width = 1.0f;
+        bool broken = false;
+        // Look-only state published to the renderer: a broken hold is washed
+        // out while the lane is up and goes back to normal once it is held
+        // again (pjsk behaviour). Judging is already over at that point.
+        bool dimmed = false;
+        // Set once the hold is fully resolved so the loop can skip it.
+        bool finished = false;
+        // Tail bookkeeping: kind 5 markers carry the hold's end time, while
+        // the *scoreable* end note sits at that same time as a 0/1/2/3 event.
+        std::size_t tailIndex = static_cast<std::size_t>(-1);
+        bool released = false;
+        float releaseTimeSec = -1.0f;
+    };
+
+    std::vector<HitNote> mNotes;
+    // One flag per note: 1 once a hold has taken this note as its tail.
+    // Needed because a *sliding* long note emits its tail event in the lane it
+    // ends in, not the one it starts in, so picking "the tail closest to the
+    // hold's start lane" made two holds that end on the same tick claim the
+    // same tail - and the other tail then sat pending until the auto-miss
+    // swallowed it. Each tail may only be claimed once.
+    std::vector<std::uint8_t> mTailClaimed;
+    std::vector<ActiveHold> mActiveHolds;
+    std::vector<float> mHoldLanes;
+    std::vector<float> mMissedHoldKeys;
+    std::vector<int> mHitEventIndices;
+    std::size_t mCursor = 0;
+    bool mLoaded = false;
+    int mTotalScoreNotes = 0;
+
+    JudgementWindows mWindows;
+    JudgementStats mStats;
+    bool mStrictFlick = true;
+    bool mFlickAsTap = false;
+    bool mAutoPlay = false;
+
+    // Score model (see kTeamPower above).
+    float mChartRating = kDefaultChartRating;
+    float mInitialLife = kMaxLife;
+    double mWeightedNoteCount = 1.0;
+    double mComboFactor = 1.0;
+
+    Judge registerJudge(Judge judge, bool critical, float volume, float kind, float noteTimeSec);
+    void registerMiss(float songTimeSec, float lifeCost);
+    double scoreDeltaFor(float kind, bool critical) const;
+    void judgeHoldTail(ActiveHold& hold, Judge judge, float songTimeSec);
+    HitNote* findCandidate(float lanePos, float songTimeSec, float margin, bool wantFlick,
+        FlickDir flickDir = FlickNone);
+    bool laneCovers(const HitNote& note, float lanePos, float margin) const;
+    bool laneHeld(const ActiveHold& hold) const;
+
+    // The score weight of one note, mirroring the upstream getHudWeight().
+    static float hudWeight(float kind, bool critical)
+    {
+        switch (static_cast<int>(kind)) {
+            case 2: return critical ? 3.0f : 1.0f;  // flick
+            case 3: return critical ? 0.2f : 0.1f;  // trace
+            case 4: return critical ? 0.2f : 0.1f;  // hold tick
+            case 0: case 1: return critical ? 2.0f : 1.0f; // tap / critical tap
+            default: return 0.0f;                   // kind 5 = hold marker (not scored)
+        }
+    }
+
+    static double judgeMultiplier(Judge judge)
+    {
+        switch (judge) {
+            case Judge::Perfect: return 1.0;
+            case Judge::Great: return 0.7;
+            case Judge::Good: return 0.5;
+            case Judge::Bad: return 0.0; // no score, breaks the combo, -50 life
+            default: return 0.0;
+        }
+    }
+
+    // flags packing (see mmw_preview.cpp): bit0 = critical, bits 1-2 = FlickDir.
+    static std::uint8_t noteFlickDir(const HitNote& note)
+    {
+        return static_cast<std::uint8_t>((static_cast<int>(note.flags) >> 1) & 3);
+    }
+};
+
+} // namespace game

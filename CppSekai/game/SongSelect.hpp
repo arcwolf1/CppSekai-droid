@@ -1,0 +1,602 @@
+// CppSekai - song select screen.
+// Scans a folder for SUS charts and pairs each one with the BGM / jacket
+// that sits next to it, then draws a pjsk-ish list + detail panel.
+#pragma once
+
+#include "platform/Renderer.hpp"
+
+#include "imgui.h" // ImVec2 in drawSongSelect's out-parameter
+
+#include <map>
+#include <string>
+#include <vector>
+
+namespace game
+{
+
+struct ChartEntry
+{
+    std::string susPath;
+    std::string bgmPath;
+    std::string coverPath;
+    std::string title;
+    std::string artist;
+    std::string lyricist;         // from a <stem>.json sidecar (SUS has no field)
+    std::string composer;         // sidecar composer, falls back to SUS artist
+    std::string arranger;         // sidecar arranger, falls back to SUS designer
+    std::string vocal;            // "初音ミク、KAITO" style list
+    std::string difficulty;       // EASY..MASTER / APPEND / ETERNAL
+    std::string level;
+    std::string kana;             // official reading (musics.json), may be empty
+    std::string mv;               // "2D" / "3D" MV tag from the sidecar (optional)
+    std::string displayName; // fallback label when the chart has no #TITLE
+
+    // Music id parsed from the file name ("0075_master.sus" -> 75). unipjsk
+    // names every chart that way; 0 when the name has no leading number.
+    int musicId = 0;
+
+    // Seconds of silence at the head of the BGM (pjsk's fillerSec). Chart time
+    // 0 sits after it, so playback starts from this position in the file.
+    // Set from the sidecar JSON ("fillerSec" / "offset"), otherwise detected.
+    double audioStartSec = 0.0;
+
+    // Best result for this chart, loaded from userdata.json next to the exe.
+    bool cleared = false;
+    bool fullCombo = false;
+    // 在收藏夹里（settings.favoriteMusicIds，按 musicId 记；见 applyFavorites）。
+    // 列表右键 / 长按可以切换，分组可以按它分「收藏 / 其他」。
+    bool favorite = false;
+    // Highest score reached on this chart, 0 when it was never cleared. The
+    // song select turns it into the score-rank badge next to the song info.
+    double bestScore = 0.0;
+};
+
+// Persisted play results, keyed by the chart's file name (e.g.
+// "0075_master.sus"). Cleared = the song was played to the end;
+// fullCombo = cleared with no MISS.
+struct ScoreRecord
+{
+    bool cleared = false;
+    bool fullCombo = false;
+    // Highest score reached, used by the result screen for 最高得分 / 新纪录!.
+    // Kept alongside the flags in the same file, so old saves stay valid.
+    double bestScore = 0.0;
+};
+
+// ---------------------------------------------------------------------------
+// Account: a local, offline profile plus the pjsk player rank.
+//
+// Nothing here is sent anywhere - it is a player card for the UI. The name and
+// the school/organisation are deliberately *not* on screen during normal play:
+// the only thing that is always visible is the level chip (top right of the
+// song select and on the result screen). The profile itself shows up on demand
+// (clicking the chip) and in 设置 -> 账户.
+struct AccountData
+{
+    std::string name; // 昵称
+    std::string org;  // 学校 / 组织
+    std::string note; // 个性签名
+
+    int rank = 1;
+    // Exp banked towards the *next* rank, i.e. addPlayerExp() already rolled
+    // the excess over. rank 1 / exp 0 is a fresh account.
+    double exp = 0.0;
+    int plays = 0;             // runs played to the end (no autoplay)
+    double totalScore = 0.0;   // sum of those runs' scores
+};
+
+// ---- Player rank ----------------------------------------------------------
+// Curve taken from the official game (Sekaipedia "Player Rank"). There, a live
+// grants `m_score * m_bonus`, and the exp a rank needs grows in bands. We have
+// no live-bonus system, so a run grants exactly the score-rank multiplier and
+// the curve is used as-is.
+//
+// Exp needed to go from `rank` to `rank + 1`. Bands: rank 1 is the tutorial
+// hand-out, then a flat 8010, +500 per rank up to 12, +1000 up to 15 and +480
+// from there on. Above kMaxPlayerRank the cap holds (0 = no next rank).
+constexpr int kMaxPlayerRank = 900;
+double expToNextRank(int rank);
+
+// Score rank ('d' / 'c' / 'b' / 'a' / 's', as produced by
+// game::scoreRankAndBar) -> the exp an official live would grant for it.
+int scoreRankExp(char rank);
+
+// 演出能量 -> 结算经验的倍率。
+//
+// 官方（4.0.0 平衡调整之后）的表：
+//   0 → ×1    1 → ×5    2 → ×10   3 → ×15   4 → ×20   5 → ×25
+//   6 → ×26   7 → ×27   8 → ×28   9 → ×29  10 → ×30
+// 能消耗的档位到 10（平时上限 5、活动期间放到 10），再往上官方没有数据。
+// 6 档起就是「20 + 消耗」这条直线，11 档以上本项目**照这条线外推** ——
+// 这段是我们自己的延伸，不是官方数值（设置页那一行和 AGENTS.md 都写明了）。
+double liveBonusExpMultiplier(int bonus);
+
+// Banks `amount` exp and rolls the rank over as often as it needs to.
+// Returns the number of ranks gained (0 = none).
+int addPlayerExp(AccountData& account, double amount);
+
+// Settings + play results are persisted together in one userdata.json; see
+// UserSettings / loadUserData below.
+
+// Everything the player keeps between sessions. Written next to the charts so
+// it survives a rebuilt build/ directory and travels with them: the score keys
+// are chart *file names*, so the same charts re-downloaded anywhere match.
+struct UserSettings
+{
+    float noteSpeed = 8.0f;
+    float seVolume = 0.8f;   // hit / UI sound effects
+    float bgmVolume = 1.0f;  // music: chart track, select preview, result BGM
+    // Game controller vibration (0 = off). Scales the song-start kick, the
+    // result screen's score roll, the 确定 flash and the per-hit flavours
+    // below; a pad without motors just ignores it.
+    float padRumble = 0.7f;
+    // Which moments buzz (settings > 判定). Each one is a short kick while the
+    // pad is already busy with the two above; all of them are moot while
+    // padRumble is 0.
+    bool rumbleFlick = true;    // a flick note was cleared
+    bool rumbleCritical = true; // a 绝赞 (yellow / critical) note was cleared
+    bool rumbleMiss = false;    // a note was missed / life was lost
+    double offsetSec = 0.0; // audio offset; the UI shows it in ms
+    double leadInSec = 6.0;
+    int windowMode = 1; // 0=borderless 1=windowed 2=fullscreen
+    // Windowed/borderless resolution. Also the *render* resolution when
+    // renderScale is 1 (then it is what the game draws at, whatever the window
+    // size is). Fullscreen always uses the desktop size for the window, but in
+    // fixed mode the render size is still this.
+    int windowWidth = 1366;
+    int windowHeight = 768;
+    // Where the window was last time (the other half of 分辨率, which only ever
+    // stored the size). -1 = 没有意见, put it in the middle of the primary
+    // screen. A remembered spot that no longer lands on any attached display
+    // (the second monitor it lived on is gone) is ignored the same way, so a
+    // laptop that undocks never opens a window off-screen - see main.cpp.
+    // Recorded on every save (the position as of the last settings write or
+    // exit), so it costs nothing while the game runs.
+    int windowX = -1;
+    int windowY = -1;
+    int fpsLimit = 60;  // 0 = vsync only; >refresh rate auto-disables vsync
+    // Render size. 0 = the window size *is* the render size (dragging the
+    // window relayouts the lanes and the HUD), 1 = always render at
+    // windowWidth x windowHeight and scale that picture into the window with
+    // the aspect ratio kept (letterbox) - dragging then only zooms the picture,
+    // it never changes the layout.
+    int renderScale = 0;
+    // How many copies of the game may run at once.
+    //   0 = one only: launching a second one just brings the running window to
+    //       the front and exits (two copies would fight over the same save).
+    //   1 = several: every extra instance logs in as a *different* user, so no
+    //       two windows ever write the same profile file. Costs one full copy
+    //       of the assets and textures per window (~250 MB); see AGENTS.md.
+    int instanceMode = 0;
+    // The user has been told that multi-open is experimental and said yes. The
+    // confirmation is asked once, the first time 允许多开 (or 多人游玩, which
+    // implies it) is turned on; afterwards the switch flips silently. Stored
+    // per profile so a fresh user gets asked again.
+    bool multiInstanceAccepted = false;
+    // Multi-instance co-op ("多人游玩"). On: this window joins the shared room
+    // every other window on this machine is in (see platform/Party.hpp), and
+    // the instance policy allows several copies at once. The first window that
+    // comes up becomes the host: it picks the song, every window picks its own
+    // difficulty and they all start on the same beat, with the host alone
+    // playing the BGM. Off (default) = plain single-window play.
+    bool multiplayer = false;
+    // Subtle playback progress bar along the top edge of the play screen.
+    bool showProgressBar = true;
+    // Hide the Windows touch ripple over our window (per-window setting).
+    bool hideTouchFeedback = true;
+    // 弱化打击特效 (weaken hit effects): keep only the most basic layer of a hit
+    // burst - the judgement spark (*_gen) and a flick's flash (*_flash) - and
+    // skip the lane lights, the auras drawn under the notes, and the particles
+    // a long note burns while it is held. Same idea as pjsk's light effect
+    // profile, and it drops a large slice of the per-frame overdraw, which is
+    // what a weak integrated GPU notices first. Default off (full effects).
+    // Implementation: core/native/mmw_port/EffectView.cpp (isSuppressed).
+    bool simpleEffects = false;
+    // 左下角显示当前帧率 (smoothed). Off by default; the play screen only.
+    bool showFps = false;
+    // 每 lane 一个键位，存 SDL_Keycode 的数值（见 main.cpp 的 kLaneKeys 作默认）。
+    // 空数组 = 用默认的 z s x d c v g b h n j m；长度为 12 时逐 lane 生效。
+    std::vector<int> laneKeys;
+    // 收藏夹里的曲目，按 musicId 记（0 表示这个谱面文件没有编号，不收）。
+    // 列表分组可以按它分「收藏 / 其他」，右键曲目即可切换。
+    std::vector<int> favoriteMusicIds;
+    // 最近打过的谱面路径（最近在前，最多 10 条）。**只喂 Windows 的任务栏跳转列表**
+    // （右键任务栏图标那份菜单），游戏自己不用它 —— 所以记在哪条起奏路径上都行，
+    // 见 main.cpp 的 announceTrack。
+    std::vector<std::string> recentSusPaths;
+    // Judgement windows, in ms. These defaults are the 宽松 preset (the official
+    // set opened up by 30 ms on every window); 设置 > 判定 > 判定预设 offers
+    // 标准 (the bare official set) and 严格 (30 ms tighter) next to it.
+    float perfectMs = 70.0f;
+    float greatMs = 120.0f;
+    float goodMs = 170.0f;
+    // BAD window end, and the point where an untouched note auto-misses. With
+    // `linkBadMiss` on (default) the two are the same number: BAD stops exactly
+    // where the note gives up. Off lets them drift apart, so a press may still
+    // read as BAD for a moment after the note has already missed on its own.
+    float badMs = 230.0f;
+    float missMs = 230.0f;
+    bool linkBadMiss = true;
+    // Long-note tolerance. Letting go earlier than holdTailGraceMs before a
+    // hold's end breaks it; the lane may be grabbed up to holdStartGraceMs
+    // after the hold start without counting as a break. Forgiving = the classic
+    // 180 / 140, tight = 120 / 80, strict = 60 / 40.
+    float holdTailGraceMs = 180.0f;
+    float holdStartGraceMs = 140.0f;
+    // Life a run starts with (100..5000). The HUD bar is normalised against it,
+    // so whatever the value the bar reads 100% when the live starts; a bigger
+    // pool just takes longer to drain. Pushed to the judgement engine, which
+    // seeds its stats from it on every reset.
+    float initialLife = 1000.0f;
+    bool strictFlick = true;
+    // "Flick 视作 Tap" (settings > 判定): flick notes take any press instead of
+    // a directional swipe, for touchscreens that can barely send an upward
+    // swipe. A hold's flick TAIL is not converted - it stops being a note (see
+    // game/Judgement.hpp).
+    bool flickAsTap = false;
+    // Flick debug log (settings > 判定 > Flick 调试日志): while on, every raw
+    // touch sample, the swipe measurement the classifier saw and the judgement
+    // it produced go to flick_debug.log next to the exe, so a missed touch
+    // flick can be diagnosed after the fact.
+    bool debugLog = false;
+    // Autoplay chart preview (all-PERFECT run, AUTO judge text, no records).
+    bool autoplay = false;
+    // Pause the run when the window loses keyboard focus (alt-tab, a popup
+    // stealing focus). Off = the song keeps running in the background.
+    bool autoPauseOnBlur = true;
+    // 最小化窗口时静音 (settings > 系统). Global: it silences the *engine*, so
+    // the song-select preview and the result BGM go quiet too, not just the
+    // chart track. Restoring the window lifts it again. Independent of
+    // autoPauseOnBlur: that one only exists on the play screen, this one is for
+    // "I alt-tabbed away and do not want the game talking to the room".
+    bool muteWhenMinimized = false;
+    // 开始游戏时切换到英文输入法 (settings > 演奏). On starting a live, ask the
+    // active IME for its alphanumeric mode, so the 12 lane keys reach the game
+    // instead of being swallowed by a pinyin composition window. Only touches
+    // the *mode* of whatever IME is already selected - it never changes the
+    // player's keyboard layout. See switchImeToAscii() in main.cpp.
+    bool switchImeOnStart = false;
+    // Report the current song to Windows (SMTC: the volume flyout / taskbar
+    // media widget). Off = nothing is announced, so a media widget showing
+    // something else is left alone.
+    bool reportSmtc = true;
+    // Splash style: 0 = static centered image (assets\splashscreen.png,
+    // default), 1 = classic dark screen with title + progress bar.
+    int splashStyle = 0;
+    // Song-select background: 0 = the built-in gradient, 1 = the user's
+    // Windows desktop wallpaper (blurred) so the screen matches the desktop.
+    // 1 is the default: a fresh install comes up with the desktop's own
+    // picture behind the list (a missing wallpaper falls back to the gradient).
+    int bgStyle = 1;
+    float bgBlur = 0.5f; // 0..1 blur amount for the wallpaper
+    float bgDim = 0.45f; // 0..1 darkening on top of it (keeps the list readable)
+    // How "透明（Aero 玻璃）" (bgStyle 2) is put together; only read then, but
+    // stored always so the answer survives switching the background away:
+    //   0 = DwmExtendFrameIntoClientArea(-1) only. The client area is glass, but
+    //       the caption and the frame DWM draws around it stay - on Win7 the
+    //       window still looks like a sheet of glass *inside a window frame*.
+    //   1 = 0 + DWMWA_NCRENDERING_POLICY = DWMNCRP_DISABLED, i.e. ask DWM to stop
+    //       drawing the non-client area. Undocumented territory: it may also take
+    //       the glass (which comes from the frame) with it. Experiment.
+    //   2 = remove the non-client area ourselves (WM_NCCALCSIZE -> 0) and put
+    //       moving/resizing back by hand (WM_NCHITTEST): the recipe Microsoft
+    //       documents in "Custom Window Frame Using DWM". Experiment.
+    int glassMode = 0;
+    // 原生菜单栏 (settings > 系统): put a real Win32 menu bar on the window and
+    // move the three *window* commands off the song select's header row into it
+    // (刷新谱面列表 / 音乐商店 / 设置). Off by default - the game's own chrome is
+    // the normal look, and the in-game buttons are the ones players know.
+    // Only a plain framed window can carry a menu bar (it is drawn in the
+    // non-client area), so borderless / fullscreen / 玻璃实现 = 自绘无框 leave it
+    // off while the setting stays on - see platform/NativeMenu.hpp.
+    bool nativeMenuBar = false;
+    // UI scale for the two screens laid out on a virtual canvas - song select and
+    // the result screen (1.0 = fit the window). The play screen and the HUD
+    // deliberately ignore it: those are played, not read, and a mis-scaled lane
+    // would be worse than a small one.
+    float uiScale = 1.0f;
+    // Song-list order / grouping, so the list comes back the way it was left
+    // (see game::drawSongSelect, which owns the two values while it runs).
+    int sortMode = 0;  // 0 = by name, 1 = by difficulty
+    // 0 = off, 1 = by level band, 2 = by reading (aiueo row: あ か さ た ...,
+    // latin letters one section each), 3 = by first character (one section per
+    // kana).
+    int groupMode = 0;
+    // 演出能量 (演出 > 演出能量): how much ライブボーナス to stake on a live.
+    // It multiplies the exp a run grants (see liveBonusExpMultiplier) - the same
+    // thing it does in the official game, where a live grants score-rank exp
+    // times the bonus multiplier. 0 = play without spending any. The official
+    // ladder covers 0..10 (you can stake up to 5 normally, 10 during an event);
+    // above that the curve is our own extension, spelled out on the function.
+    int liveBonus = 5;
+    // The 许可 / 免责声明 card (the ELUA) comes up over the song select on the
+    // first run. Tick "以后不再显示" in it and this goes true, so the card never
+    // appears again. It is a *picked* flag (the dialog does not have to be
+    // dismissed to keep playing), so it lives per profile, like the settings it
+    // is part of: a second user gets told once as well.
+    bool eulaAccepted = false;
+};
+
+// Path of userdata.json: <exeDir>\.. \userdata.json when a charts\ folder sits
+// there (the usual build/ layout - so the file lands next to charts/ and
+// survives wiping build/), otherwise <exeDir>\userdata.json for a packaged
+// build. exeDir must end with a path separator.
+std::string userDataPath(const std::string& exeDir);
+
+// ---------------------------------------------------------------------------
+// Local profiles (multi-user). Each user keeps their own settings / scores /
+// account in <dataDir>\profiles\<id>.json; <dataDir>\profiles\index.json lists
+// the users and which one is active. The first run copies the old single
+// <dataDir>\userdata.json into the "default" profile, so nothing is lost.
+// ---------------------------------------------------------------------------
+struct UserProfile
+{
+    std::string id;   // file-name safe, unique
+    std::string name; // what the UI shows
+};
+
+// Folder that holds userdata.json / profiles/ - i.e. dirname(userDataPath()).
+std::string userDataDir(const std::string& exeDir);
+
+// Reads the profile list, creating it (and importing userdata.json) when it is
+// missing. `active` receives the id of the active profile and is never left
+// empty.
+std::vector<UserProfile> loadProfiles(const std::string& dataDir, std::string& active);
+
+void saveProfiles(const std::string& dataDir, const std::vector<UserProfile>& profiles,
+    const std::string& active);
+
+// Path of one profile's data file.
+std::string profileDataPath(const std::string& dataDir, const std::string& id);
+
+// A free profile id derived from `name` ("初音" -> "user<hash>", "xxt" -> "xxt",
+// a second "xxt" -> "xxt2").
+std::string makeProfileId(const std::string& name, const std::vector<UserProfile>& existing);
+
+// Reads settings + scores + account. A legacy flat scores.json (a bare map, no
+// "settings"/"scores" wrapper) is still accepted, so an old file migrates.
+// Missing keys keep the defaults already in `settings` / `account` - which is
+// also what an existing userdata.json (written before the account existed)
+// ends up as: defaults, no error.
+void loadUserData(const std::string& path, UserSettings& settings,
+    std::map<std::string, ScoreRecord>& scores, AccountData& account);
+
+void saveUserData(const std::string& path, const UserSettings& settings,
+    const std::map<std::string, ScoreRecord>& scores, const AccountData& account);
+
+// True when `path` parses as a profile file - a JSON object carrying a
+// "settings" or a "scores" member. 设置 > 账户 > 导入 asks this before its
+// confirmation card, so a picked file that is *not* user data (any other json
+// on the machine) is rejected while there is still nothing to undo.
+bool isUserDataFile(const std::string& path);
+
+// Records the result of one chart (merges with the existing record) and
+// returns the merged record. `score` only ever raises the stored best.
+ScoreRecord mergeScore(const ScoreRecord& old, bool cleared, bool fullCombo, double score = 0.0);
+
+// One vocal version of a song (the official musicVocals table). `asset` is the
+// game's assetbundleName, which is also the audio file stem next to the chart:
+// charts\se_0374_01.mp3 etc. (see music-vocals.json / CHARTS.md).
+struct VocalVersion
+{
+    int id = 0;
+    std::string type;     // "sekai" / "virtual_singer" / "another_vocal" / ...
+    std::string caption;  // "セカイver." - the official label
+    std::string asset;    // assetbundleName, e.g. "an_0374_02"
+    std::vector<std::string> singers;
+    // The version's audio file exists next to the chart. Only filled in by
+    // availableVocals(); the table itself does not know about files.
+    bool available = false;
+};
+
+// Vocal versions of a song, in official order (empty when unknown).
+const std::vector<VocalVersion>& musicVocals(int musicId);
+
+// Same, but annotated with `available` - and only the versions that actually
+// have their mp3 next to the chart. This is what the song select shows: no
+// file means no chip, so a song with a single <id4>.mp3 download keeps looking
+// exactly like before.
+std::vector<VocalVersion> availableVocals(const ChartEntry& entry);
+
+// Short label for a chip in the song select ("セカイ" / "バーチャル" / "みのり").
+std::string vocalShortLabel(const VocalVersion& version);
+
+// Index of the version to start with: the セカイver when there is one (that is
+// also what the legacy <id4>.mp3 download is), else the first.
+int defaultVocalIndex(int musicId, const std::vector<VocalVersion>& available);
+
+// Points `entry` at a version's audio (and its singers, for the "Vo." line).
+// Returns false when that version has no file, in which case entry is left with
+// whatever BGM the chart scan found.
+bool applyVocalVersion(ChartEntry& entry, const std::vector<VocalVersion>& versions, int index);
+
+// Absolute path of a version's mp3 (empty when it is not on disk). Used by the
+// song select's music preview, which has to follow the chosen chip without
+// mutating the (const) entry the list owns.
+std::string vocalAudioPath(const ChartEntry& entry, int index);
+
+// Gives `entry` a usable BGM when the plain chart scan found none: charts that
+// ship only official vocal files (se_0374_01.mp3 / vs_0374_01.mp3 ...) have no
+// <id4>.mp3 for findSidecar() to pick, and used to come out silent - including
+// in the song select preview. Picks the セカイver like the version switcher's
+// default. Does nothing when the entry already has a BGM.
+void applyDefaultVocal(ChartEntry& entry);
+
+// Official vocal table (music-vocals.json, generated by
+// .workbuddy/tools/gen_music_vocals.py). Optional: without it the song select
+// simply offers no version switcher.
+void loadMusicVocals(const std::string& path);
+
+// Community song aliases (music-aliases.json, exported from the public
+// HarukiBot API by .workbuddy/tools/fetch_music_aliases.py). Optional like the
+// other tables: without it the search just loses the alias branch ("tyw",
+// "梦开始的地方", "mmj团歌" ...). Matching is exact, not substring.
+void loadMusicAliases(const std::string& path);
+
+// Key used in scores.json: the chart's file name (e.g. "0075_master.sus").
+std::string scoreKey(const ChartEntry& entry);
+
+// Copies cleared / fullCombo from the map into the entries.
+void applyScores(std::vector<ChartEntry>& entries, const std::map<std::string, ScoreRecord>& scores);
+
+// 收藏夹：把 settings.favoriteMusicIds（musicId 列表）填进 entries[i].favorite。
+// 收藏是按曲目记的（不是按难度），所以一个 group 的四个难度一起亮。
+void applyFavorites(std::vector<ChartEntry>& entries, const std::vector<int>& favoriteMusicIds);
+
+// Assets root (the directory that contains the "select" subfolder, i.e.
+// <exeDir>\assets). The select UI PNGs (shuffle / settings buttons, the phone
+// frame and the clear indicators) load from <dir>\select\<name>.png.
+// Call once at startup.
+void setSelectAssetDir(const std::string& dir);
+
+// Optional song-select backdrop (the blurred desktop wallpaper). `texture` 0
+// falls back to the built-in gradient. texW/texH are the texture's pixel size
+// (used to cover the screen without distorting it) and `dim` (0..1) is a dark
+// overlay drawn on top so the white text stays readable. The host owns the
+// texture and calls this again whenever the setting changes.
+void setSelectBackdrop(GLuint texture, int texW, int texH, float dim);
+
+// "Aero glass" mode: draw no background fill at all (neither the wallpaper nor
+// the built-in gradient), leaving the window transparent so the desktop shows
+// through. The floating triangle field and every panel/list on top stay - this
+// only removes the flat wash behind them. Needs the window's alpha channel and
+// DWM's extended frame, which the host sets up (see main.cpp).
+void setSelectTransparentBackground(bool enabled);
+
+// Official per-difficulty levels, keyed by song id. unipjsk exports have their
+// SUS header stripped (no #TITLE / #PLAYLEVEL, "#DIFFICULTY 0"), so the level
+// has to come from the game's own data. Two formats are accepted:
+//   { "75": [6, 13, 17, 23, 28], ... }   // easy, normal, hard, expert, master
+//   [ { "musicId": 75, "musicDifficulty": "master", "playLevel": 28 }, ... ]
+// The second is the game's own musicDifficulties.json verbatim, so it can be
+// dropped in unchanged. May be called more than once; later entries win.
+void loadMusicLevels(const std::string& path);
+
+// Level of `difficulty` ("EASY".."MASTER") for a song id, 0 when unknown.
+int musicLevel(int musicId, const std::string& difficulty);
+
+// pjsk difficulty colour (EASY green / NORMAL blue / HARD orange / EXPERT red /
+// MASTER purple / APPEND / ETERNAL), with `alpha`. Unknown difficulties fall
+// back to a neutral slate. Shared by the song select badges and the result
+// screen's difficulty capsule, which has to follow the actual difficulty.
+ImU32 difficultyColor(const std::string& difficulty, int alpha = 255);
+
+// Official song readings and titles from the game's musics.json: the reading
+// drives "sort by name" and the aiueo grouping, the title fills in charts whose
+// #TITLE is empty (every unipjsk export). Accepts the verbatim table (an array
+// of objects with "id" / "pronunciation" / "title") or a compact map, either
+// {"75": "よんぴき..."} (readings only) or
+// {"75": {"kana": "...", "title": "..."}}. Songs without an entry fall back to
+// whatever the chart itself carries. May be called more than once; later
+// entries win.
+void loadMusicMaster(const std::string& path);
+
+// Recursively collects *.sus under dir (bounded depth). Entries are sorted
+// by title then file name.
+std::vector<ChartEntry> scanChartFolder(const std::string& dir);
+
+// "0075_master" -> "MASTER", "easy" -> "EASY"; empty when nothing matches.
+std::string inferDifficulty(const std::string& name);
+
+// Fills in the sidecar paths (bgm / jacket), difficulty and display name for
+// a chart we already know about (e.g. one passed on the command line).
+void resolveSidecars(ChartEntry& entry);
+
+// 选曲列表的分组方式（settings.groupMode，见 ui 里的「分组」下拉）：
+// 0 关闭 / 1 按难度段 / 2 按读音 / 3 按首字 / 4 按收藏。
+// 存档读回来时要按这个上限 clamp —— 以前那里写死 3，加了「按收藏」之后会把 4 咬掉。
+constexpr int kSelectGroupCount = 5;
+
+enum SelectAction
+{
+    SelectNone = -1,
+    SelectQuit = -2,
+    SelectRescan = -3,
+    SelectSettings = -4, // the musicsetting button was pressed (open settings)
+    // The list is empty and the player pressed 下载谱面: the host launches
+    // chartdl.exe (the standalone downloader) and re-scans when it exits.
+    SelectDownload = -5,
+};
+
+// ---------------------------------------------------------------------------
+// 多人游玩 on the song select (see platform/Party.hpp).
+//
+// The room has no screen of its own: the list belongs to the host, everybody
+// else sees it greyed out and read-only, and the phone panel shows the song the
+// host is parked on so a member picks a difficulty right there. 确定 is what
+// starts the round - every window presses it once and the live begins as soon
+// as the last player has.
+//
+// Pass `party` (and `partyOut`) only when the shared room is live; leaving them
+// out is plain single-window play.
+// ---------------------------------------------------------------------------
+struct SelectPartyInfo
+{
+    bool active = false; // the shared room is live
+    bool host = false;   // this window is the host, so it keeps the list
+    // The song the room is locked on, resolved against *this* window's own
+    // chart list (-1 = this window does not have that chart, or nothing is
+    // locked yet - `songLocked` tells the two apart).
+    bool songLocked = false;
+    int lockedEntry = -1;
+    int myDifficulty = -1;  // canonical index (see game::difficultyIndex), -1 = none
+    bool confirmed = false; // this window already pressed 确定 for this song
+    bool spectating = false; // opted out of this round (观察)
+    std::string status;     // room line under the 确定 button
+};
+
+struct SelectPartyResult
+{
+    int difficulty = -1;   // the player picked this canonical difficulty index
+    bool confirm = false;  // 确定 was pressed (confirm / start the round)
+    bool spectate = false; // 旁观 was pressed (leave this round, stay in the room)
+};
+
+// Draws the screen. `selected` is kept between frames; returns the index of
+// the chart to start, SelectNone, or SelectQuit.
+// `sortMode` / `groupMode` are in/out: the list's sort and grouping live in the
+// settings, so they survive a restart (the caller persists them when they
+// change). `vocalIndex` is out-only: the index (into availableVocals()) of the
+// version currently picked for the selected song, so the caller can point the
+// entry at that audio before starting. -1 = the song has no chooser at all.
+// `uiScale` scales the whole 1080p canvas this screen is laid out on (1.0 =
+// exactly fit the window, see UserSettings::uiScale). `confirmCenter` receives
+// the on-screen centre of the 确定 button, which main.cpp uses as the origin of
+// the white confirm flash (the button is drawn tilted, so this is the tilted
+// position, not the layout one).
+//
+// In 多人游玩 a member's 确定 never comes back as a chart index: it arrives in
+// `partyOut` instead (the room decides what starts, see SelectPartyInfo).
+//
+// `nativeMenuBar` (设置 > 系统) means the window carries a real Win32 menu bar,
+// which owns 刷新谱面列表 / 音乐商店 / 设置 now - the header row drops those
+// three buttons and keeps 猜歌, so the two never duplicate each other. The
+// actions themselves are unchanged: main.cpp maps the menu ids onto the very
+// same SelectRescan / SelectDownload / showDebug paths.
+int drawSongSelect(platform::Renderer& renderer, const std::vector<ChartEntry>& entries, int& selected,
+    int windowW, int windowH, float timeSec, int& sortMode, int& groupMode, int& vocalIndex,
+    float uiScale = 1.0f, ImVec2* confirmCenter = nullptr, const AccountData* account = nullptr,
+    const SelectPartyInfo* party = nullptr, SelectPartyResult* partyOut = nullptr,
+    int* favoriteToggle = nullptr, bool nativeMenuBar = false, int* deleteRequest = nullptr);
+
+// Debug (`--profile`): force the profile card open. It normally only appears
+// when the level chip is clicked, which a --screenshot run cannot do.
+void debugOpenProfileCard(bool open);
+
+// Debug (`--guess`): open the 猜歌 quiz (the header button's card) at boot, for
+// the same reason. Also usable to close it again.
+void debugOpenGuessDialog(bool open);
+
+// True while the 猜歌 card is up. The main loop checks this before acting on
+// ESC: with the card open, ESC belongs to the card (it closes it) and must not
+// reach the "leave the live / quit the game" branch. That branch runs *before*
+// drawSongSelect in a frame, so it reads the previous frame's state - which is
+// exactly what makes it work: the frame ESC is pressed, the card is still open.
+bool guessDialogOpen();
+
+// Debug (`--singer-panel`): open the 切换歌手 panel (the phone panel's singer
+// button) at boot, same reason. It only appears on a song that has a vocal
+// version table, so pair it with --select-id / --select-vocal.
+void debugOpenSingerPanel(bool open);
+
+} // namespace game

@@ -1,0 +1,235 @@
+// CppSekai - native GL renderer
+// Consumes packed quads from the chart core (mmw_preview.cpp) and draws them
+// with desktop OpenGL 3.3 core. Layout-compatible with the WebGL renderer in
+// sekai-mmw-preview-web (AGPL-3.0), so visuals match the web preview.
+#pragma once
+
+#include <array>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+using GLuint = unsigned int;
+
+namespace platform
+{
+
+class Renderer
+{
+  public:
+    Renderer();
+    ~Renderer();
+
+    // `width`/`height` are the *logical* window size (SDL_GetWindowSize - DPI
+    // scaled points, see setCanvasSize). resize() then reports the real pixel
+    // size of the same window.
+    bool init(int width, int height, std::string& outError);
+    // The real window changed. `width`/`height` are the window's *pixel* size
+    // (SDL_GL_GetDrawableSize), which is not SDL_GetWindowSize on a display with
+    // a DPI scale factor: there a 1280x720 window is 1920x1080 pixels at 150%.
+    void resize(int width, int height);
+    // Logical window size (SDL_GetWindowSize). Layout, SDL events, ImGui and the
+    // letterbox math all live in these units; only the GL viewport and the
+    // screenshot use the pixels, so that the picture is *sampled* at the
+    // display's real resolution instead of being bitmap-stretched by Windows.
+    void setCanvasSize(int width, int height);
+
+    // -----------------------------------------------------------------------
+    // Output size (the "render mode" setting).
+    //
+    // By default the scene is drawn straight into the window, so the window
+    // size *is* the render size and everything (lanes, HUD) rescales with it.
+    // setRenderTargetSize(w, h) instead renders into an offscreen buffer of
+    // exactly that size and presents it into the window with the aspect ratio
+    // preserved - dragging the window then only scales the picture, it does not
+    // change what the game draws. Pass (0, 0) to go back to window-sized.
+    //
+    // While offscreen, width()/height() keep reporting the *render* size, which
+    // is what the playfield projection and the UI layout must use.
+    // -----------------------------------------------------------------------
+    void setRenderTargetSize(int width, int height);
+    [[nodiscard]] bool offscreen() const { return mOffscreen; }
+    [[nodiscard]] int windowWidth() const { return mCanvasW; }
+    [[nodiscard]] int windowHeight() const { return mCanvasH; }
+    // Uniform scale from render pixels to window *points* (1.0 when not
+    // offscreen) and the letterbox rect in window points, top-left based. Used
+    // to map pointer positions, so these stay in the logical space.
+    [[nodiscard]] float outputScale() const;
+    void outputRect(int& x, int& y, int& w, int& h) const;
+    // Presents the offscreen buffer (no-op when drawing straight to the
+    // window). Must run after the ImGui pass, which draws into the same buffer.
+    void presentFrame();
+
+    bool loadAssets(const std::string& assetDir, std::string& outError);
+
+    // Loads only the background + stage so a frame can be drawn before the
+    // rest of the startup (HUD sprites, CJK font atlas) finishes. Textures
+    // already present are kept, so loadAssets() afterwards is cheap for them.
+    bool loadSplash(const std::string& assetDir, std::string& outError);
+
+    // HUD sprites (pjsk overlay textures) drawn with ImGui on top of the field.
+    struct HudSprite
+    {
+        GLuint id = 0;
+        int width = 0;
+        int height = 0;
+    };
+
+    bool loadHud(const std::string& overlayDir, std::string& outError);
+    [[nodiscard]] const HudSprite* hud(const std::string& name) const;
+
+    // Installs a song-specific stage backdrop ("bggen v3", see
+    // game/StageBackground.cpp) in place of the default room plate: the stage
+    // screens show this song's jacket. RGBA8, `width` x `height` must match the
+    // plate. Pixels are copied into a GL texture; the static background quad is
+    // rebuilt for the new texture size. Pass nullptr (or 0 size) to go back to
+    // the default plate.
+    bool setSongBackground(const std::uint8_t* rgba, int width, int height, std::string& outError);
+
+    // Album cover / jacket shown by the opening card and the song list.
+    // Pass an empty path (or clearCover) when the chart has no jacket.
+    bool loadCover(const std::string& path, std::string& outError);
+    void clearCover();
+    [[nodiscard]] const HudSprite* cover() const { return mCover.id != 0 ? &mCover : nullptr; }
+
+    // Lane highlight: a soft additive glow drawn on the playfield for the
+    // lanes the player is touching / hovering. Width is in lane units
+    // (1.0 = one lane), intensity 0..1.
+    struct LaneGlow
+    {
+        float center = 0.0f;
+        float halfWidth = 0.5f;
+        float intensity = 1.0f;
+    };
+    void setLaneGlows(const std::vector<LaneGlow>& glows) { mLaneGlows = glows; }
+    void setLaneGlowTint(float r, float g, float b) { mLaneGlowTint = {r, g, b}; }
+
+    // The chart core fires its note-hit effect timeline automatically
+    // (autoplay-style). Player mode replaces it with judgement-driven
+    // effects, so core effect quads (textureId >= 3) are opt-in.
+    void setDrawCoreEffects(bool enabled) { mDrawCoreEffects = enabled; }
+
+    // Transparent background ("Aero glass"): the frame is cleared to alpha 0
+    // and the background plate (background_overlay.png) is not drawn at all, so
+    // whatever is behind the window shows through - the blurred desktop on Win7
+    // Aero, plain per-pixel transparency on Win8+. The stage, the playfield and
+    // every effect keep drawing normally, only the flat fill goes away.
+    //
+    // The host has to set up the two things this depends on: SDL_GL_ALPHA_SIZE 8
+    // (the window's default framebuffer must carry alpha) and DWM's
+    // DwmExtendFrameIntoClientArea(-1) - see main.cpp's window setup.
+    void setTransparentBackground(bool enabled) { mTransparentBackground = enabled; }
+
+    // Projects a playfield world position to window pixel coordinates
+    // (y down). Used to place judgement effects on the judge line.
+    void worldToScreen(float worldX, float worldY, float& outX, float& outY) const;
+
+    // Draws background + stage, then the packed runtime quads produced by
+    // the chart core's render(chartTimeSec). playfieldVisibility (0..1) is
+    // the opening-card fade: it scales the stage and note alpha, matching
+    // GlRenderer::renderFrame() upstream.
+    void renderFrame(const float* packedQuads, int quadCount, float backgroundBrightness,
+        float playfieldVisibility = 1.0f);
+
+    // World <-> clip conversions for input hit-testing.
+    // Lane coordinates: world x in "lane units", note centers come from
+    // getNoteCenter() which is (lane - 6) + width / 2.
+    float clipToWorldX(float clipX) const;
+    float clipToWorldY(float clipY) const;
+
+    int width() const { return mWidth; }
+    int height() const { return mHeight; }
+
+    // Loads an arbitrary image for UI use (song list thumbnails). Returns the
+    // GL texture id, 0 on failure. Not cached - the caller owns caching.
+    GLuint loadUiTexture(const std::string& path, std::string& outError);
+
+    // Same, but decodes at full size, box-downscales it and runs a blur, so a
+    // desktop wallpaper can be used as a soft background. `blur01` is 0..1
+    // (0 = no blur). Reports the uploaded texture's pixel size (the caller
+    // needs the aspect ratio to draw it covering the screen). Not cached.
+    GLuint loadBackdropTexture(const std::string& path, float blur01, int& outW, int& outH,
+        std::string& outError);
+
+    // Uploads an RGBA8 buffer as a GL texture (linear, clamped). For UI art the
+    // game builds at runtime instead of loading from disk - the result screen's
+    // RESULT watermark, see platform/FontOutline.hpp. Not cached; the caller
+    // owns the id. Returns 0 for an empty buffer.
+    GLuint createTextureFromRgba(const unsigned char* rgba, int width, int height);
+
+    Renderer(const Renderer&) = delete;
+    Renderer& operator=(const Renderer&) = delete;
+
+  private:
+    struct Texture
+    {
+        GLuint id = 0;
+        int width = 0;
+        int height = 0;
+    };
+
+    bool createPrograms(std::string& outError);
+    // `maxDim` (0 = keep) caps the longer side, shrinking by whole powers of
+    // two; `cropHeight` (0 = keep) drops everything below that row. Both are
+    // applied right after decode so oversized game art does not hold on to
+    // memory it is never drawn from (see the definition for the numbers).
+    Texture loadTextureFromFile(const std::string& path, std::string& outError, int maxDim = 0,
+        int cropHeight = 0);
+    void drawVertices(const Texture& texture, const std::vector<float>& vertices, bool effectPass, int blendMode);
+    void buildStaticVertices();
+    void drawStaticScene(float backgroundBrightness, float playfieldVisibility);
+    void drawLaneGlows();
+
+    std::array<float, 2> worldToClip(float worldX, float worldY) const;
+
+    // The same two, for an explicit target size: the public ones are in logical
+    // window points, presentFrame() letterboxes into the real pixel size.
+    float outputScaleIn(int windowW, int windowH) const;
+    void outputRectIn(int windowW, int windowH, int& x, int& y, int& w, int& h) const;
+
+    int mWidth = 1;
+    int mHeight = 1;
+    // Real drawable size of the window in pixels (SDL_GL_GetDrawableSize). On a
+    // display with a DPI scale factor this is bigger than mCanvasW/H, and it is
+    // what the GL viewport uses.
+    int mWindowW = 1;
+    int mWindowH = 1;
+    // Logical window size in DPI scaled points (SDL_GetWindowSize). Equal to
+    // mWindowW/H at 100% scaling. The composition is laid out in these units,
+    // and so are pointer positions, so the letterbox math uses them too.
+    int mCanvasW = 1;
+    int mCanvasH = 1;
+    bool mOffscreen = false;
+    GLuint mFbo = 0;
+    GLuint mFboTexture = 0;
+
+    GLuint mProgram = 0;
+    GLuint mEffectProgram = 0;
+    GLuint mVao = 0;
+    GLuint mVbo = 0;
+
+    Texture mBackground;
+    // The default plate, so a song-specific stage background can be swapped
+    // out again without re-deriving the asset path.
+    std::string mDefaultBackgroundPath;
+    Texture mStage;
+    Texture mNotes;
+    Texture mLongNoteLine;
+    Texture mTouchLine;
+    Texture mEffect;
+    Texture mWhite; // 1x1 white, used for the lane highlight gradient
+    HudSprite mCover;
+
+    std::vector<LaneGlow> mLaneGlows;
+    std::array<float, 3> mLaneGlowTint{0.55f, 0.85f, 1.0f};
+
+    std::vector<float> mStaticBackgroundVertices;
+    std::vector<float> mStaticStageVertices;
+
+    std::map<std::string, HudSprite> mHudSprites;
+    bool mDrawCoreEffects = false;
+    bool mTransparentBackground = false;
+};
+
+} // namespace platform

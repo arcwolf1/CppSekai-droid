@@ -1,0 +1,16 @@
+// Windows resources for the game executable (cppsekai.exe).
+//
+// Compiled by `zig rc` and linked straight into the exe, so Explorer, the
+// taskbar and the Alt-Tab switcher show the game's icon even before it runs.
+// The downloader uses chartdl.rc instead: the same icon and version block (both
+// live in resources.rc), but its own application manifest.
+
+#include "resources.rc"
+
+// Application manifest (RT_MANIFEST = 24, CREATEPROCESS_MANIFEST_RESOURCE_ID = 1):
+// declares the Common Controls 6.0 dependency so native widgets come up themed
+// instead of in the flat Windows 95 style. The game itself draws with SDL+ImGui,
+// so this is mainly for the downloader - but both exes carry one, and the game's
+// manifest stays separate so chartdl can declare DPI awareness on its own.
+// Details in app.manifest / chartdl.manifest next to this file.
+1 24 "app.manifest"
