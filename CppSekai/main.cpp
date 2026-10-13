@@ -19,6 +19,16 @@
 #include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 #include "platform/win_compat.h"
+#ifdef __ANDROID__
+// armeabi-v7a 目标设备基本是 2015 年前的老设备（Mali-400 等），
+// 开场动画的封面纹理在那些 GPU 上渲染失败。编译时判定：armv7 走简化开场
+// （保留标题/作者文字，跳过封面纹理），arm64 全功能。
+#if defined(__arm__) && !defined(__aarch64__)
+bool gWeakGpu = true;
+#else
+bool gWeakGpu = false;
+#endif
+#endif
 #ifndef SDL_HINT_WINDOWS_DPI_SCALING
 #define SDL_HINT_WINDOWS_DPI_SCALING "SDL_WINDOWS_DPI_SCALING"
 #endif
@@ -5828,6 +5838,9 @@ int main(int argc, char** argv)
     // outside the playfield (e.g. on the sky above the horizon), where the
     // inverse perspective would map it to a bogus lane.
     auto beginPointer = [&](SDL_FingerID id, int x, int y, bool isTouch, Uint32 eventMs) {
+        std::printf("[ptr] begin id=%d isTouch=%d x=%d y=%d touches=%zu\n",
+            (int)id, (int)isTouch, x, y, touches.size());
+        std::fflush(stdout);
         const float clipX = (static_cast<float>(x) / static_cast<float>(windowW)) * 2.0f - 1.0f;
         const float clipY = 1.0f - (static_cast<float>(y) / static_cast<float>(windowH)) * 2.0f;
         const float worldY = renderer.clipToWorldY(clipY);
@@ -5995,6 +6008,8 @@ int main(int argc, char** argv)
     };
 
     auto endPointer = [&](SDL_FingerID id) {
+        std::printf("[ptr] end id=%d touches_before=%zu\n", (int)id, touches.size());
+        std::fflush(stdout);
         touches.erase(std::remove_if(touches.begin(), touches.end(),
                           [&](const TouchTrack& track) { return track.fingerId == id; }),
             touches.end());
@@ -7067,6 +7082,10 @@ int main(int argc, char** argv)
                 // when it lands on the HUD pause button.
                 // ------------------------------------------------------
                 case SDL_MOUSEBUTTONDOWN: {
+                    std::printf("[mouse] DOWN button=%d which=%u x=%d y=%d touches=%zu\n",
+                        event.button.button, event.button.which,
+                        event.button.x, event.button.y, touches.size());
+                    std::fflush(stdout);
                     // Diagnostic (CPSEKAI_UI_TRACE=1): proves a posted click
                     // arrived at all - invaluable when driving the UI headless,
                     // where a swallowed event and a mis-measured hit box look
@@ -7156,6 +7175,10 @@ int main(int argc, char** argv)
                     break;
                 }
                 case SDL_MOUSEBUTTONUP: {
+                    std::printf("[mouse] UP button=%d which=%u x=%d y=%d touches=%zu\n",
+                        event.button.button, event.button.which,
+                        event.button.x, event.button.y, touches.size());
+                    std::fflush(stdout);
                     if (event.button.which == SDL_TOUCH_MOUSEID) {
                         break; // touch release is handled by the finger path
                     }

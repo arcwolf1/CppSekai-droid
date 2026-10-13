@@ -817,6 +817,81 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
     public static native void onNativeKeyUp(int keycode);
     public static native boolean onNativeSoftReturnKey();
     public static native void onNativeKeyboardFocusLost();
+
+
+
+    /**
+     * 统一发送鼠标按钮事件。Android 的 getButtonState() 是位掩码
+     * （左=1,右=2,中=4），和 SDL 的 SDL_BUTTON_* 编码不一致，必须逐位拆。
+     * onTouch 和 onGenericMotion 两个入口共享 sLastMouseButtonState，
+     * 否则按下走一个通道、抬起走另一个通道，状态机会卡住。
+     */
+    /**
+     * 鼠标按钮改成走触摸事件通道。
+     *
+     * 为什么不用 onNativeMouse：SDL2 的 SDL_SendMouseButton 内部维护自己的按钮状态，
+     * MOVE 事件会干扰它——它认为按钮没按下时直接丢弃 RELEASE，结果就是"粘住"。
+     * 同时按左右键也无法产生两个独立指针。
+     *
+     * 触摸事件没有这些限制：每个 fingerId 是独立触点，CppSekai 的判定本来就
+     * 按 fingerId 分轨道，天生支持多押。
+     *
+     * fingerId 约定：
+     *   100 = 鼠标左键
+     *   101 = 鼠标右键
+     *   102 = 鼠标中键
+     */
+    static void sendMouseButtons(int newState, int action, float x, float y, float w, float h, boolean relative) {
+        final float nx = (w > 0) ? (x / w) : 0.5f;
+        final float ny = (h > 0) ? (y / h) : 0.5f;
+
+        // MOVE：Android 在按钮状态变化时不重发 DOWN/UP，只更新 buttonState 并发 MOVE。
+        // 所以这里必须先检测按钮的增删，补发 DOWN/UP，再发移动。
+        if (action == MotionEvent.ACTION_MOVE) {
+            final int changedM = sLastMouseButtonState ^ newState;
+            if ((changedM & 1) != 0) {
+                int a = ((newState & 1) != 0) ? MotionEvent.ACTION_DOWN : MotionEvent.ACTION_UP;
+                onNativeTouch(0, 100, a, nx, ny, 1.0f);
+            }
+            if ((changedM & 2) != 0) {
+                int a = ((newState & 2) != 0) ? MotionEvent.ACTION_DOWN : MotionEvent.ACTION_UP;
+                onNativeTouch(0, 101, a, nx, ny, 1.0f);
+            }
+            if ((changedM & 4) != 0) {
+                int a = ((newState & 4) != 0) ? MotionEvent.ACTION_DOWN : MotionEvent.ACTION_UP;
+                onNativeTouch(0, 102, a, nx, ny, 1.0f);
+            }
+            // 然后按着不放的每个都发一条移动
+            if ((newState & 1) != 0) onNativeTouch(0, 100, MotionEvent.ACTION_MOVE, nx, ny, 1.0f);
+            if ((newState & 2) != 0) onNativeTouch(0, 101, MotionEvent.ACTION_MOVE, nx, ny, 1.0f);
+            if ((newState & 4) != 0) onNativeTouch(0, 102, MotionEvent.ACTION_MOVE, nx, ny, 1.0f);
+            sLastMouseButtonState = newState;
+            return;
+        }
+
+        final int changed = sLastMouseButtonState ^ newState;
+        android.util.Log.i("SDL_MOUSE_JAVA", "newState=" + newState
+            + " last=" + sLastMouseButtonState + " changed=" + changed);
+        if ((changed & 1) != 0) {  // PRIMARY → fingerId 100
+            int a = ((newState & 1) != 0) ? MotionEvent.ACTION_DOWN : MotionEvent.ACTION_UP;
+            onNativeTouch(0, 100, a, nx, ny, 1.0f);
+        }
+        if ((changed & 2) != 0) {  // SECONDARY → fingerId 101
+            int a = ((newState & 2) != 0) ? MotionEvent.ACTION_DOWN : MotionEvent.ACTION_UP;
+            onNativeTouch(0, 101, a, nx, ny, 1.0f);
+        }
+        if ((changed & 4) != 0) {  // TERTIARY → fingerId 102
+            int a = ((newState & 4) != 0) ? MotionEvent.ACTION_DOWN : MotionEvent.ACTION_UP;
+            onNativeTouch(0, 102, a, nx, ny, 1.0f);
+        }
+        sLastMouseButtonState = newState;
+    }
+
+    // 鼠标按钮状态跟踪：Android 的 getButtonState() 是位掩码（左=1,右=2,中=4），
+    // 和 SDL 的 SDL_BUTTON_* 编码不一致，必须逐位拆成独立事件。
+    // 同时按左右键时 getButtonState()=3，直接透传给 SDL 会被当成"只按右键"。
+    static int sLastMouseButtonState = 0;
+
     public static native void onNativeMouse(int button, int action, float x, float y, boolean relative);
     public static native void onNativeTouch(int touchDevId, int pointerFingerId,
                                             int action, float x,
@@ -1930,6 +2005,10 @@ class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
     public boolean onTouch(View v, MotionEvent event) {
         /* Ref: http://developer.android.com/training/gestures/multi.html */
         int touchDevId = event.getDeviceId();
+        android.util.Log.i("SDL_TOUCH", "onTouch action=" + event.getActionMasked()
+            + " source=0x" + Integer.toHexString(event.getSource())
+            + " pointers=" + event.getPointerCount()
+            + " devId=" + touchDevId);
         final int pointerCount = event.getPointerCount();
         int action = event.getActionMasked();
         int pointerFingerId;
@@ -1949,23 +2028,38 @@ class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
         // 12290 = Samsung DeX mode desktop mouse
         // 12290 = 0x3002 = 0x2002 | 0x1002 = SOURCE_MOUSE | SOURCE_TOUCHSCREEN
         // 0x2   = SOURCE_CLASS_POINTER
-        if (event.getSource() == InputDevice.SOURCE_MOUSE || event.getSource() == (InputDevice.SOURCE_MOUSE | InputDevice.SOURCE_TOUCHSCREEN)) {
-            int mouseButton = 1;
+        // 只把真正的鼠标当鼠标。原条件里 `SOURCE_MOUSE | SOURCE_TOUCHSCREEN`
+        // 会让"被系统报告成鼠标的触摸屏"也走鼠标路径——SDL 生成带
+        // SDL_TOUCH_MOUSEID 的合成鼠标事件，CppSekai 会把它当"重复事件"丢掉，
+        // 表现就是同一次触摸有时生效有时不生效（断触）。
+        if (event.getSource() == InputDevice.SOURCE_MOUSE) {
+            android.util.Log.i("SDL_MOUSE_JAVA", "onTouch action=" + action);
+            // Android 的 button state 是位掩码：PRIMARY=1, SECONDARY=2, TERTIARY=4
+            // SDL 期望：LEFT=1, MIDDLE=2, RIGHT=3
+            // 左右同按时 getButtonState() = 3，直接透传给 SDL 会被当成"只按右键"。
+            // 这里跟踪状态变化，为每个按钮单独发 SDL 事件。
+            int newState = 0;
             try {
                 Object object = event.getClass().getMethod("getButtonState").invoke(event);
                 if (object != null) {
-                    mouseButton = (Integer) object;
+                    newState = (Integer) object;
                 }
             } catch(Exception ignored) {
             }
+            // ACTION_UP / CANCEL：所有按钮都松了
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                newState = 0;
+            }
+            // ACTION_DOWN 但 buttonState=0（部分设备第一次按下时没带 state）：当左键
+            if (action == MotionEvent.ACTION_DOWN && newState == 0) {
+                newState = 1;
+            }
 
-            // We need to check if we're in relative mouse mode and get the axis offset rather than the x/y values
-            // if we are.  We'll leverage our existing mouse motion listener
             SDLGenericMotionListener_API12 motionListener = SDLActivity.getMotionListener();
             x = motionListener.getEventX(event);
             y = motionListener.getEventY(event);
 
-            SDLActivity.onNativeMouse(mouseButton, action, x, y, motionListener.inRelativeMode());
+            SDLActivity.sendMouseButtons(newState, action, x, y, mWidth, mHeight, motionListener.inRelativeMode());
         } else {
             switch(action) {
                 case MotionEvent.ACTION_MOVE:
@@ -2116,6 +2210,8 @@ class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
 
             case MotionEvent.ACTION_BUTTON_PRESS:
             case MotionEvent.ACTION_BUTTON_RELEASE:
+                android.util.Log.i("SDL_MOUSE_JAVA", "onGenericMotion action=" + action
+                    + " buttonState=" + event.getButtonState());
 
                 // Change our action value to what SDL's code expects.
                 if (action == MotionEvent.ACTION_BUTTON_PRESS) {
@@ -2126,9 +2222,13 @@ class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
 
                 x = event.getX(0);
                 y = event.getY(0);
-                int button = event.getButtonState();
-
-                SDLActivity.onNativeMouse(button, action, x, y, true);
+                // 用 getButtonState() 的完整位掩码，与 onTouch 共享同一状态机。
+                // 逐位拆成独立 SDL 事件，同时按左右键就能双押。
+                int newState = event.getButtonState();
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    newState = 0;
+                }
+                SDLActivity.sendMouseButtons(newState, action, x, y, mWidth, mHeight, true);
                 return true;
         }
 
